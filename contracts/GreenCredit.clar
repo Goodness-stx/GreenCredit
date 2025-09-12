@@ -17,6 +17,9 @@
 (define-constant err-invalid-principal (err u111))
 (define-constant err-invalid-standard (err u112))
 (define-constant err-standard-not-supported (err u113))
+(define-constant err-batch-too-large (err u114))
+(define-constant err-batch-empty (err u115))
+(define-constant err-batch-validation-failed (err u116))
 
 ;; Validation constants
 (define-constant max-fee u1000) ;; Maximum 10% fee
@@ -25,6 +28,7 @@
 (define-constant max-string-length u100)
 (define-constant max-standard-length u50)
 (define-constant max-description-length u200)
+(define-constant max-batch-size u20) ;; Maximum items per batch operation
 
 ;; Supported verification standards
 (define-constant standard-vcs "VCS")
@@ -37,6 +41,7 @@
 (define-data-var next-credit-id uint u1)
 (define-data-var platform-fee uint u250) ;; 2.5% in basis points
 (define-data-var next-transaction-id uint u1)
+(define-data-var next-batch-id uint u1)
 
 ;; Data Maps
 (define-map carbon-credits
@@ -87,6 +92,18 @@
     is-active: bool,
     min-project-size: uint,
     description: (string-ascii 200)
+  }
+)
+
+(define-map batch-operations
+  { batch-id: uint }
+  {
+    operation-type: (string-ascii 20),
+    operator: principal,
+    timestamp: uint,
+    items-count: uint,
+    total-credits: uint,
+    success-count: uint
   }
 )
 
@@ -167,6 +184,122 @@
   )
 )
 
+;; Batch validation functions
+(define-private (is-valid-batch-size (batch-size uint))
+  (and (> batch-size u0) (<= batch-size max-batch-size))
+)
+
+;; Batch credit issuance helper
+(define-private (issue-single-credit 
+  (item {
+    project-name: (string-ascii 100),
+    verification-standard: (string-ascii 50),
+    vintage-year: uint,
+    total-credits: uint,
+    price-per-credit: uint,
+    methodology: (string-ascii 100)
+  })
+  (acc { success-count: uint, total-credits: uint, last-error: (optional uint) }))
+  (let (
+    (credit-id (var-get next-credit-id))
+    (current-block stacks-block-height)
+    (project-name (get project-name item))
+    (verification-standard (get verification-standard item))
+    (vintage-year (get vintage-year item))
+    (total-credits (get total-credits item))
+    (price-per-credit (get price-per-credit item))
+    (methodology (get methodology item))
+  )
+    (if (and 
+          (can-verifier-use-standard tx-sender verification-standard)
+          (> total-credits u0)
+          (> price-per-credit u0)
+          (is-valid-string project-name)
+          (is-valid-verification-standard verification-standard)
+          (is-standard-active verification-standard)
+          (is-valid-vintage-year vintage-year)
+          (is-valid-methodology methodology))
+      (begin
+        (map-set carbon-credits 
+          { credit-id: credit-id }
+          {
+            issuer: tx-sender,
+            project-name: project-name,
+            verification-standard: verification-standard,
+            vintage-year: vintage-year,
+            total-credits: total-credits,
+            available-credits: total-credits,
+            price-per-credit: price-per-credit,
+            is-verified: true,
+            is-retired: false,
+            created-at: current-block,
+            methodology: methodology
+          }
+        )
+        (set-credit-balance tx-sender credit-id total-credits)
+        (var-set next-credit-id (+ credit-id u1))
+        {
+          success-count: (+ (get success-count acc) u1),
+          total-credits: (+ (get total-credits acc) total-credits),
+          last-error: none
+        }
+      )
+      {
+        success-count: (get success-count acc),
+        total-credits: (get total-credits acc),
+        last-error: (some u116)
+      }
+    )
+  )
+)
+
+;; Batch retirement helper
+(define-private (retire-single-credit 
+  (item { credit-id: uint, amount: uint })
+  (acc { success-count: uint, total-credits: uint, last-error: (optional uint) }))
+  (let (
+    (credit-id (get credit-id item))
+    (amount (get amount item))
+    (credit-info-result (map-get? carbon-credits { credit-id: credit-id }))
+    (owner-balance (get-credit-balance tx-sender credit-id))
+  )
+    (match credit-info-result
+      credit-info
+        (if (and 
+              (> amount u0)
+              (>= owner-balance amount)
+              (not (get is-retired credit-info)))
+          (begin
+            ;; Reduce owner balance
+            (set-credit-balance tx-sender credit-id (- owner-balance amount))
+            
+            ;; Update available credits
+            (map-set carbon-credits 
+              { credit-id: credit-id }
+              (merge credit-info { available-credits: (- (get available-credits credit-info) amount) })
+            )
+            
+            {
+              success-count: (+ (get success-count acc) u1),
+              total-credits: (+ (get total-credits acc) amount),
+              last-error: none
+            }
+          )
+          {
+            success-count: (get success-count acc),
+            total-credits: (get total-credits acc),
+            last-error: (some u102)
+          }
+        )
+      {
+        success-count: (get success-count acc),
+        total-credits: (get total-credits acc),
+        last-error: (some u101)
+      }
+    )
+  )
+)
+
 ;; Public Functions
 
 ;; Issue new carbon credits with methodology support
@@ -211,6 +344,48 @@
     (var-set next-credit-id (+ credit-id u1))
     
     (ok credit-id)
+  )
+)
+
+;; Batch issue carbon credits
+(define-public (batch-issue-carbon-credits 
+  (credits-list (list 20 {
+    project-name: (string-ascii 100),
+    verification-standard: (string-ascii 50),
+    vintage-year: uint,
+    total-credits: uint,
+    price-per-credit: uint,
+    methodology: (string-ascii 100)
+  })))
+  (let (
+    (batch-size (len credits-list))
+    (batch-id (var-get next-batch-id))
+    (result (fold issue-single-credit credits-list 
+                   { success-count: u0, total-credits: u0, last-error: none }))
+  )
+    (asserts! (is-valid-batch-size batch-size) err-batch-empty)
+    (asserts! (is-none (get last-error result)) err-batch-validation-failed)
+    
+    ;; Record batch operation
+    (map-set batch-operations
+      { batch-id: batch-id }
+      {
+        operation-type: "ISSUE",
+        operator: tx-sender,
+        timestamp: stacks-block-height,
+        items-count: batch-size,
+        total-credits: (get total-credits result),
+        success-count: (get success-count result)
+      }
+    )
+    
+    (var-set next-batch-id (+ batch-id u1))
+    
+    (ok {
+      batch-id: batch-id,
+      success-count: (get success-count result),
+      total-credits: (get total-credits result)
+    })
   )
 )
 
@@ -283,6 +458,41 @@
     )
     
     (ok true)
+  )
+)
+
+;; Batch retire carbon credits
+(define-public (batch-retire-credits 
+  (retirement-list (list 20 { credit-id: uint, amount: uint })))
+  (let (
+    (batch-size (len retirement-list))
+    (batch-id (var-get next-batch-id))
+    (result (fold retire-single-credit retirement-list 
+                   { success-count: u0, total-credits: u0, last-error: none }))
+  )
+    (asserts! (is-valid-batch-size batch-size) err-batch-empty)
+    (asserts! (is-none (get last-error result)) err-batch-validation-failed)
+    
+    ;; Record batch operation
+    (map-set batch-operations
+      { batch-id: batch-id }
+      {
+        operation-type: "RETIRE",
+        operator: tx-sender,
+        timestamp: stacks-block-height,
+        items-count: batch-size,
+        total-credits: (get total-credits result),
+        success-count: (get success-count result)
+      }
+    )
+    
+    (var-set next-batch-id (+ batch-id u1))
+    
+    (ok {
+      batch-id: batch-id,
+      success-count: (get success-count result),
+      total-credits: (get total-credits result)
+    })
   )
 )
 
@@ -376,6 +586,10 @@
   (map-get? credit-transactions { transaction-id: transaction-id })
 )
 
+(define-read-only (get-batch-info (batch-id uint))
+  (map-get? batch-operations { batch-id: batch-id })
+)
+
 (define-read-only (is-authorized-verifier (verifier principal))
   (match (map-get? verifier-status { verifier: verifier })
     verifier-info (get is-authorized verifier-info)
@@ -396,6 +610,10 @@
 
 (define-read-only (get-next-credit-id)
   (var-get next-credit-id)
+)
+
+(define-read-only (get-next-batch-id)
+  (var-get next-batch-id)
 )
 
 (define-read-only (get-supported-standard-info (standard (string-ascii 50)))
