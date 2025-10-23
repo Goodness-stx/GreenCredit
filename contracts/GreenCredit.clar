@@ -20,6 +20,8 @@
 (define-constant err-batch-too-large (err u114))
 (define-constant err-batch-empty (err u115))
 (define-constant err-batch-validation-failed (err u116))
+(define-constant err-invalid-multiplier (err u117))
+(define-constant err-price-floor-exceeded (err u118))
 
 ;; Validation constants
 (define-constant max-fee u1000) ;; Maximum 10% fee
@@ -29,6 +31,14 @@
 (define-constant max-standard-length u50)
 (define-constant max-description-length u200)
 (define-constant max-batch-size u20) ;; Maximum items per batch operation
+
+;; Dynamic pricing constants
+(define-constant base-multiplier u10000) ;; 100% in basis points
+(define-constant max-price-multiplier u50000) ;; 500% maximum
+(define-constant min-price-multiplier u5000) ;; 50% minimum
+(define-constant demand-threshold-high u8000) ;; 80% utilization
+(define-constant demand-threshold-low u2000) ;; 20% utilization
+(define-constant price-adjustment-rate u500) ;; 5% adjustment per threshold
 
 ;; Supported verification standards
 (define-constant standard-vcs "VCS")
@@ -42,6 +52,7 @@
 (define-data-var platform-fee uint u250) ;; 2.5% in basis points
 (define-data-var next-transaction-id uint u1)
 (define-data-var next-batch-id uint u1)
+(define-data-var dynamic-pricing-enabled bool true)
 
 ;; Data Maps
 (define-map carbon-credits
@@ -53,11 +64,14 @@
     vintage-year: uint,
     total-credits: uint,
     available-credits: uint,
-    price-per-credit: uint,
+    base-price: uint,
+    price-floor: uint,
     is-verified: bool,
     is-retired: bool,
     created-at: uint,
-    methodology: (string-ascii 100)
+    methodology: (string-ascii 100),
+    total-sold: uint,
+    last-price-update: uint
   }
 )
 
@@ -107,6 +121,15 @@
   }
 )
 
+(define-map price-history
+  { credit-id: uint, timestamp: uint }
+  {
+    price: uint,
+    utilization-rate: uint,
+    demand-multiplier: uint
+  }
+)
+
 ;; Initialize supported standards
 (map-set supported-standards 
   { standard: standard-vcs }
@@ -139,6 +162,84 @@
 
 (define-private (calculate-platform-fee (amount uint))
   (/ (* amount (var-get platform-fee)) u10000)
+)
+
+;; Dynamic pricing calculation functions
+(define-private (calculate-utilization-rate (available uint) (total uint))
+  (if (is-eq total u0)
+    u0
+    (/ (* (- total available) u10000) total)
+  )
+)
+
+(define-private (calculate-demand-multiplier (utilization-rate uint))
+  (if (>= utilization-rate demand-threshold-high)
+    ;; High demand: increase price
+    (let ((excess (- utilization-rate demand-threshold-high)))
+      (+ base-multiplier (/ (* excess price-adjustment-rate) u1000))
+    )
+    (if (<= utilization-rate demand-threshold-low)
+      ;; Low demand: decrease price
+      (let ((deficit (- demand-threshold-low utilization-rate)))
+        (- base-multiplier (/ (* deficit price-adjustment-rate) u1000))
+      )
+      ;; Normal demand: base price
+      base-multiplier
+    )
+  )
+)
+
+(define-private (calculate-dynamic-price (base-price uint) (price-floor uint) (utilization-rate uint))
+  (let (
+    (demand-multiplier (calculate-demand-multiplier utilization-rate))
+    (capped-multiplier (if (> demand-multiplier max-price-multiplier)
+                          max-price-multiplier
+                          (if (< demand-multiplier min-price-multiplier)
+                            min-price-multiplier
+                            demand-multiplier)))
+    (calculated-price (/ (* base-price capped-multiplier) base-multiplier))
+  )
+    (if (< calculated-price price-floor)
+      price-floor
+      calculated-price
+    )
+  )
+)
+
+(define-private (get-current-price (credit-id uint))
+  (match (map-get? carbon-credits { credit-id: credit-id })
+    credit-info
+      (if (var-get dynamic-pricing-enabled)
+        (let (
+          (utilization-rate (calculate-utilization-rate 
+                              (get available-credits credit-info)
+                              (get total-credits credit-info)))
+          (dynamic-price (calculate-dynamic-price 
+                           (get base-price credit-info)
+                           (get price-floor credit-info)
+                           utilization-rate))
+        )
+          dynamic-price
+        )
+        (get base-price credit-info)
+      )
+    u0
+  )
+)
+
+(define-private (record-price-history (credit-id uint) (price uint) (utilization-rate uint) (demand-multiplier uint))
+  (let (
+    (current-block stacks-block-height)
+  )
+    (map-set price-history
+      { credit-id: credit-id, timestamp: current-block }
+      {
+        price: price,
+        utilization-rate: utilization-rate,
+        demand-multiplier: demand-multiplier
+      }
+    )
+  )
 )
 
 ;; Validation functions
@@ -184,9 +285,12 @@
   )
 )
 
-;; Batch validation functions
 (define-private (is-valid-batch-size (batch-size uint))
   (and (> batch-size u0) (<= batch-size max-batch-size))
+)
+
+(define-private (is-valid-price-multiplier (multiplier uint))
+  (and (>= multiplier min-price-multiplier) (<= multiplier max-price-multiplier))
 )
 
 ;; Batch credit issuance helper
@@ -196,7 +300,8 @@
     verification-standard: (string-ascii 50),
     vintage-year: uint,
     total-credits: uint,
-    price-per-credit: uint,
+    base-price: uint,
+    price-floor: uint,
     methodology: (string-ascii 100)
   })
   (acc { success-count: uint, total-credits: uint, last-error: (optional uint) }))
@@ -207,13 +312,16 @@
     (verification-standard (get verification-standard item))
     (vintage-year (get vintage-year item))
     (total-credits (get total-credits item))
-    (price-per-credit (get price-per-credit item))
+    (base-price (get base-price item))
+    (price-floor (get price-floor item))
     (methodology (get methodology item))
   )
     (if (and 
           (can-verifier-use-standard tx-sender verification-standard)
           (> total-credits u0)
-          (> price-per-credit u0)
+          (> base-price u0)
+          (> price-floor u0)
+          (<= price-floor base-price)
           (is-valid-string project-name)
           (is-valid-verification-standard verification-standard)
           (is-standard-active verification-standard)
@@ -229,11 +337,14 @@
             vintage-year: vintage-year,
             total-credits: total-credits,
             available-credits: total-credits,
-            price-per-credit: price-per-credit,
+            base-price: base-price,
+            price-floor: price-floor,
             is-verified: true,
             is-retired: false,
             created-at: current-block,
-            methodology: methodology
+            methodology: methodology,
+            total-sold: u0,
+            last-price-update: current-block
           }
         )
         (set-credit-balance tx-sender credit-id total-credits)
@@ -260,10 +371,9 @@
   (let (
     (credit-id (get credit-id item))
     (amount (get amount item))
-    (credit-info-result (map-get? carbon-credits { credit-id: credit-id }))
     (owner-balance (get-credit-balance tx-sender credit-id))
   )
-    (match credit-info-result
+    (match (map-get? carbon-credits { credit-id: credit-id })
       credit-info
         (if (and 
               (> amount u0)
@@ -300,15 +410,21 @@
   )
 )
 
+;; Helper function for validating standards in list
+(define-private (validate-standard-in-list (standard (string-ascii 50)) (acc bool))
+  (and acc (is-valid-verification-standard standard))
+)
+
 ;; Public Functions
 
-;; Issue new carbon credits with methodology support
+;; Issue new carbon credits with dynamic pricing support
 (define-public (issue-carbon-credits 
   (project-name (string-ascii 100))
   (verification-standard (string-ascii 50))
   (vintage-year uint)
   (total-credits uint)
-  (price-per-credit uint)
+  (base-price uint)
+  (price-floor uint)
   (methodology (string-ascii 100)))
   (let (
     (credit-id (var-get next-credit-id))
@@ -316,7 +432,9 @@
   )
     (asserts! (can-verifier-use-standard tx-sender verification-standard) err-not-authorized)
     (asserts! (> total-credits u0) err-invalid-amount)
-    (asserts! (> price-per-credit u0) err-invalid-price)
+    (asserts! (> base-price u0) err-invalid-price)
+    (asserts! (> price-floor u0) err-invalid-price)
+    (asserts! (<= price-floor base-price) err-price-floor-exceeded)
     (asserts! (is-valid-string project-name) err-invalid-string)
     (asserts! (is-valid-verification-standard verification-standard) err-invalid-standard)
     (asserts! (is-standard-active verification-standard) err-standard-not-supported)
@@ -332,11 +450,14 @@
         vintage-year: vintage-year,
         total-credits: total-credits,
         available-credits: total-credits,
-        price-per-credit: price-per-credit,
+        base-price: base-price,
+        price-floor: price-floor,
         is-verified: true,
         is-retired: false,
         created-at: current-block,
-        methodology: methodology
+        methodology: methodology,
+        total-sold: u0,
+        last-price-update: current-block
       }
     )
     
@@ -354,7 +475,8 @@
     verification-standard: (string-ascii 50),
     vintage-year: uint,
     total-credits: uint,
-    price-per-credit: uint,
+    base-price: uint,
+    price-floor: uint,
     methodology: (string-ascii 100)
   })))
   (let (
@@ -389,23 +511,35 @@
   )
 )
 
-;; Purchase carbon credits
+;; Purchase carbon credits with dynamic pricing
 (define-public (purchase-credits (credit-id uint) (amount uint))
   (let (
     (credit-info (unwrap! (map-get? carbon-credits { credit-id: credit-id }) err-not-found))
     (seller (get issuer credit-info))
     (seller-balance (get-credit-balance seller credit-id))
-    (price-per-credit (get price-per-credit credit-info))
-    (total-cost (* amount price-per-credit))
+    (current-price (get-current-price credit-id))
+    (utilization-rate (calculate-utilization-rate 
+                        (get available-credits credit-info)
+                        (get total-credits credit-info)))
+    (demand-multiplier (calculate-demand-multiplier utilization-rate))
+    (total-cost (* amount current-price))
     (fee-amount (calculate-platform-fee total-cost))
     (seller-amount (- total-cost fee-amount))
     (buyer-current-balance (get-credit-balance tx-sender credit-id))
     (transaction-id (var-get next-transaction-id))
+    (current-block stacks-block-height)
   )
     (asserts! (> amount u0) err-invalid-amount)
+    (asserts! (> current-price u0) err-invalid-price)
     (asserts! (>= seller-balance amount) err-insufficient-balance)
     (asserts! (not (get is-retired credit-info)) err-credit-retired)
     (asserts! (>= (get available-credits credit-info) amount) err-insufficient-balance)
+    
+    ;; Transfer STX from buyer to seller
+    (try! (stx-transfer? seller-amount tx-sender seller))
+    
+    ;; Transfer platform fee to contract owner
+    (try! (stx-transfer? fee-amount tx-sender contract-owner))
     
     ;; Update seller balance
     (set-credit-balance seller credit-id (- seller-balance amount))
@@ -413,11 +547,18 @@
     ;; Update buyer balance
     (set-credit-balance tx-sender credit-id (+ buyer-current-balance amount))
     
-    ;; Update available credits
+    ;; Update credit info
     (map-set carbon-credits 
       { credit-id: credit-id }
-      (merge credit-info { available-credits: (- (get available-credits credit-info) amount) })
+      (merge credit-info { 
+        available-credits: (- (get available-credits credit-info) amount),
+        total-sold: (+ (get total-sold credit-info) amount),
+        last-price-update: current-block
+      })
     )
+    
+    ;; Record price history
+    (record-price-history credit-id current-price utilization-rate demand-multiplier)
     
     ;; Record transaction
     (map-set credit-transactions
@@ -427,18 +568,18 @@
         seller: seller,
         buyer: tx-sender,
         amount: amount,
-        price: price-per-credit,
-        timestamp: stacks-block-height
+        price: current-price,
+        timestamp: current-block
       }
     )
     
     (var-set next-transaction-id (+ transaction-id u1))
     
-    (ok transaction-id)
+    (ok { transaction-id: transaction-id, price: current-price })
   )
 )
 
-;; Retire carbon credits (remove from circulation)
+;; Retire carbon credits
 (define-public (retire-credits (credit-id uint) (amount uint))
   (let (
     (credit-info (unwrap! (map-get? carbon-credits { credit-id: credit-id }) err-not-found))
@@ -516,11 +657,6 @@
   )
 )
 
-;; Helper function for validating standards in list
-(define-private (validate-standard-in-list (standard (string-ascii 50)) (acc bool))
-  (and acc (is-valid-verification-standard standard))
-)
-
 ;; Admin function to add new verification standard
 (define-public (add-verification-standard 
   (standard (string-ascii 50)) 
@@ -556,6 +692,15 @@
   )
 )
 
+;; Admin function to toggle dynamic pricing
+(define-public (toggle-dynamic-pricing (enabled bool))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (var-set dynamic-pricing-enabled enabled)
+    (ok true)
+  )
+)
+
 ;; Admin function to deactivate a verification standard
 (define-public (deactivate-standard (standard (string-ascii 50)))
   (let (
@@ -574,8 +719,52 @@
 
 ;; Read-only functions
 
+(define-read-only (is-standard-supported (standard (string-ascii 50)))
+  (begin
+    (asserts! (> (len standard) u0) err-invalid-string)
+    (asserts! (<= (len standard) max-standard-length) err-invalid-string)
+    (ok (is-some (map-get? supported-standards { standard: standard })))
+  )
+)
+
 (define-read-only (get-credit-info (credit-id uint))
   (map-get? carbon-credits { credit-id: credit-id })
+)
+
+(define-read-only (get-current-credit-price (credit-id uint))
+  (ok (get-current-price credit-id))
+)
+
+(define-read-only (get-price-components (credit-id uint))
+  (match (map-get? carbon-credits { credit-id: credit-id })
+    credit-info
+      (let (
+        (utilization-rate (calculate-utilization-rate 
+                            (get available-credits credit-info)
+                            (get total-credits credit-info)))
+        (demand-multiplier (calculate-demand-multiplier utilization-rate))
+        (current-price (if (var-get dynamic-pricing-enabled)
+                          (calculate-dynamic-price 
+                            (get base-price credit-info)
+                            (get price-floor credit-info)
+                            utilization-rate)
+                          (get base-price credit-info)))
+      )
+        (ok {
+          base-price: (get base-price credit-info),
+          price-floor: (get price-floor credit-info),
+          current-price: current-price,
+          utilization-rate: utilization-rate,
+          demand-multiplier: demand-multiplier,
+          dynamic-pricing-enabled: (var-get dynamic-pricing-enabled)
+        })
+      )
+    err-not-found
+  )
+)
+
+(define-read-only (get-price-history-at (credit-id uint) (timestamp uint))
+  (map-get? price-history { credit-id: credit-id, timestamp: timestamp })
 )
 
 (define-read-only (get-user-balance (owner principal) (credit-id uint))
@@ -608,6 +797,10 @@
   (var-get platform-fee)
 )
 
+(define-read-only (is-dynamic-pricing-enabled)
+  (var-get dynamic-pricing-enabled)
+)
+
 (define-read-only (get-next-credit-id)
   (var-get next-credit-id)
 )
@@ -621,23 +814,5 @@
     (asserts! (> (len standard) u0) err-invalid-string)
     (asserts! (<= (len standard) max-standard-length) err-invalid-string)
     (ok (map-get? supported-standards { standard: standard }))
-  )
-)
-
-(define-read-only (is-standard-supported (standard (string-ascii 50)))
-  (begin
-    (asserts! (> (len standard) u0) err-invalid-string)
-    (asserts! (<= (len standard) max-standard-length) err-invalid-string)
-    (ok (is-some (map-get? supported-standards { standard: standard })))
-  )
-)
-
-(define-read-only (get-credits-by-standard (standard (string-ascii 50)))
-  (begin
-    (asserts! (> (len standard) u0) err-invalid-string)
-    (asserts! (<= (len standard) max-standard-length) err-invalid-string)
-    ;; This is a simplified version - in a real implementation, 
-    ;; you might want to use a separate map to track credits by standard
-    (ok "Use external indexing for this query")
   )
 )
